@@ -1,0 +1,59 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "MultiCloudAIDiscoveryAndPricing",
+      "Effect": "Allow",
+      "Action": [
+        "resource-explorer-2:Search",
+        "pricing:GetProducts",
+
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeRouteTables",
+        "ec2:DescribeInternetGateways",
+        "ec2:DescribeNetworkAcls",
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeKeyPairs",
+        "ec2:DescribeDhcpOptions",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeAddresses",
+
+        "s3:GetBucketLocation",
+        "s3:GetBucketVersioning",
+
+        "ecr:DescribeRepositories",
+
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBClusters",
+
+        "secretsmanager:DescribeSecret",
+        "elasticache:DescribeReplicationGroups",
+
+        "lambda:GetFunction",
+
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeListeners",
+        "elasticloadbalancing:DescribeTargetGroups",
+
+        "cloudfront:GetDistribution",
+
+        "glue:GetJob",
+        "glue:GetWorkflow",
+
+        "ecs:DescribeServices",
+        "ecs:DescribeClusters",
+
+        "eks:DescribeCluster",
+
+        "route53:GetHostedZone",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

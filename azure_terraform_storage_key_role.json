@@ -1,0 +1,10 @@
+{
+  "Name": "MultiCloudAI Terraform Storage Key Reader",
+  "IsCustom": true,
+  "Description": "Supplement existing Reader access for AzureRM source reconstruction. Allows reading storage account keys; those keys can grant data access. Does not allow role assignment, key regeneration or resource modification.",
+  "Actions": ["Microsoft.Storage/storageAccounts/listKeys/action"],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": ["/subscriptions/2e64ac5c-bc96-4389-a5bb-fc1c2e7bf8d7/resourceGroups/Internal-POC"]
+}

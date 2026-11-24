@@ -81,7 +81,11 @@ class GCPAdapter(CloudAdapter):
         d = _plain(data)
         text = str(asset_type or "").lower()
         cfg = {"raw_asset": d}
-        if "compute.googleapis.com/instance" in text:
+        if "firestore.googleapis.com/database" in text:
+            cfg['realtime_database'] = {key: d.get(key) for key in (
+                'name', 'locationId', 'type', 'concurrencyMode', 'appEngineIntegrationMode',
+                'pointInTimeRecoveryEnablement', 'deleteProtectionState')}
+        elif "compute.googleapis.com/instance" in text:
             disks = d.get("disks") or []
             boot = next((x for x in disks if isinstance(x, dict) and x.get("boot")), disks[0] if disks else {})
             initialize = (boot.get("initializeParams") or {}) if isinstance(boot, dict) else {}

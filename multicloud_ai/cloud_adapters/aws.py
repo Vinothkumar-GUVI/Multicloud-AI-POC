@@ -97,6 +97,40 @@ class AWSAdapter(CloudAdapter):
             return self._client(service_name, region or (self.region if item_region == "global" else item_region))
         cfg={"resource_explorer": {k:_plain(v) for k,v in item.items() if k not in {"Arn","Region","Service","ResourceType"}}}
         try:
+            if service in {'mq', 'amazonmq'} and 'broker' in rtype:
+                broker_id = arn.rsplit(':', 1)[-1]
+                data = _plain(regional_client('mq').describe_broker(BrokerId=broker_id))
+                cfg['message_broker'] = {key: data.get(key) for key in (
+                    'BrokerId', 'BrokerName', 'BrokerArn', 'EngineType', 'EngineVersion', 'DeploymentMode',
+                    'HostInstanceType', 'StorageType', 'SubnetIds', 'SecurityGroups', 'PubliclyAccessible',
+                    'EncryptionOptions', 'AuthenticationStrategy', 'MaintenanceWindowStartTime')}
+                return cfg
+            if service == 'workspaces' and 'workspace' in rtype:
+                rows = regional_client('workspaces').describe_workspaces(WorkspaceIds=[rid]).get('Workspaces', [])
+                if rows:
+                    cfg['virtual_desktop'] = _plain({key: rows[0].get(key) for key in (
+                        'WorkspaceId','DirectoryId','BundleId','SubnetId','WorkspaceProperties',
+                        'RootVolumeEncryptionEnabled','UserVolumeEncryptionEnabled')})
+                return cfg
+            if service == 'fsx' and ('file' in rtype or '/fs-' in arn):
+                rows = regional_client('fsx').describe_file_systems(FileSystemIds=[rid]).get('FileSystems', [])
+                if rows:
+                    cfg['file_system'] = _plain({key: rows[0].get(key) for key in (
+                        'FileSystemType','StorageCapacity','StorageType','VpcId','SubnetIds','NetworkInterfaceIds',
+                        'OpenZFSConfiguration','KmsKeyId')})
+                return cfg
+            if service == 'neptune' or 'neptune' in rtype:
+                identifier = arn.rsplit(':', 1)[-1]
+                if 'cluster' in rtype:
+                    rows = regional_client('neptune').describe_db_clusters(DBClusterIdentifier=identifier).get('DBClusters', [])
+                else:
+                    rows = regional_client('neptune').describe_db_instances(DBInstanceIdentifier=identifier).get('DBInstances', [])
+                if rows:
+                    cfg['graph_database'] = _plain({key: rows[0].get(key) for key in (
+                        'Engine','EngineVersion','DBInstanceClass','DBClusterIdentifier','DBSubnetGroup',
+                        'VpcSecurityGroups','StorageEncrypted','BackupRetentionPeriod','MultiAZ')})
+                    cfg['graph_database']['query_api'] = 'Not exposed by cluster metadata; supply RDF/SPARQL, Gremlin or openCypher requirements.'
+                return cfg
             network_lookups = {
                 "route-table": ("describe_route_tables", "RouteTableIds", "RouteTables"),
                 "internet-gateway": ("describe_internet_gateways", "InternetGatewayIds", "InternetGateways"),
@@ -225,7 +259,12 @@ class AWSAdapter(CloudAdapter):
             elif service=="dynamodb" and "table" in rtype.lower():
                 y=_plain(regional_client("dynamodb").describe_table(TableName=rid).get("Table",{})); cfg["database"]={"engine":"dynamodb","key_schema":y.get("KeySchema") or [],"attribute_definitions":y.get("AttributeDefinitions") or [],"billing_mode":(y.get("BillingModeSummary") or {}).get("BillingMode"),"provisioned_throughput":y.get("ProvisionedThroughput") or {},"sse":y.get("SSEDescription") or {},"global_secondary_indexes":y.get("GlobalSecondaryIndexes") or []}
         except Exception as exc:
-            cfg["discovery_warning"]=f"Service-specific configuration could not be retrieved: {exc}"
+            from multicloud_ai.core.agents import redact
+            response = getattr(exc, 'response', {})
+            code = str((response.get('Error') or {}).get('Code', '')) if isinstance(response, dict) else ''
+            if code in {'AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation', 'Forbidden', 'ForbiddenException'}:
+                cfg['permission_issue'] = {'code': code, 'operation': str(getattr(exc, 'operation_name', 'service configuration read'))}
+            cfg["discovery_warning"]=str(redact(f"Service-specific configuration could not be retrieved: {exc}"))
         return cfg
 
     def discover(self, resource_ids):
@@ -246,7 +285,13 @@ class AWSAdapter(CloudAdapter):
                     if wanted and rid.rstrip("/") not in wanted and _arn_id(rid) not in wanted_short: continue
                     cfg=self._service_configuration(item)
                     props=cfg.get("resource_explorer",{})
-                    out.append(NormalizedResource(rid,rid.split("/")[-1].split(":")[-1],"AWS",aws_resource_kind(item.get("ResourceType",""),item.get("Service","")),item.get("ResourceType",""),item.get("Service",""),item.get("Region",self.region),"",configuration=cfg,configuration_source="AWS Resource Explorer + service API",configuration_confidence="Partial" if cfg.get("discovery_warning") else "Confirmed" if any(k != "resource_explorer" for k in cfg) else "Inventory metadata only"))
+                    kind = aws_resource_kind(item.get('ResourceType', ''), item.get('Service', ''))
+                    if str(cfg.get('file_system', {}).get('FileSystemType', '')).upper() == 'OPENZFS':
+                        kind = 'zfs_storage'
+                    if str(cfg.get('database', {}).get('engine', '')).lower() == 'neptune':
+                        kind = 'graph_database'
+                        cfg['graph_database'] = cfg['database']
+                    out.append(NormalizedResource(rid,rid.split("/")[-1].split(":")[-1],"AWS",kind,item.get("ResourceType",""),item.get("Service",""),item.get("Region",self.region),"",configuration=cfg,configuration_source="AWS Resource Explorer + service API",configuration_confidence="Partial" if cfg.get("discovery_warning") else "Confirmed" if any(k != "resource_explorer" for k in cfg) else "Inventory metadata only"))
                 token=resp.get("NextToken")
                 if not token: break
         except Exception as exc:

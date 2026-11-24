@@ -11,6 +11,27 @@ def resource(raw, name='app'):
                               name, 'Azure', 'other', raw_type=raw)
 
 
+def test_ai_provider_region_reference_gets_a_required_declaration():
+    code = complete_target('provider "aws" { region = var.aws_region }\n', [], 'AWS')
+    assert 'aws_region' in required_inputs(code)
+    assert code.count('variable "aws_region"') == 1
+
+
+def test_adjacent_single_line_public_ips_all_have_distinct_coverage():
+    resources = [resource('Microsoft.Network/publicIPAddresses', name) for name in
+                 ['DevTest-ip', 'dwh-platform-ip', 'mlops-ip', 'mlopsip616', 'mlopsip847', 'nacmachineA-ip-cca5941d']]
+    from multicloud_ai.core.terraform import _resource_maps, _rid
+    _, names = _resource_maps(resources)
+    code = '\n'.join('resource "aws_eip" "' + names[_rid(r)] + '" { domain = "vpc" }' for r in resources)
+    completed = complete_target(code, resources, 'AWS')
+    rows = coverage_rows(resources, '', completed)
+    assert len(rows) == 6
+    assert all('Generated' in row['Status'] for row in rows)
+    assert len(hcl2.loads(completed)['resource']) == 6
+    for r, row in zip(resources, rows):
+        assert row['Target Terraform'] == 'aws_eip.' + names[_rid(r)]
+
+
 def test_missing_supported_services_have_required_variables_and_amber_coverage():
     resources = [resource(t, 'app' + str(i)) for i, t in enumerate([
         'Microsoft.Insights/components', 'Microsoft.Web/sites', 'Microsoft.Web/serverfarms',
@@ -226,7 +247,7 @@ resource "google_cloud_run_v2_service" "app" {
     rows = coverage_rows(resources, '', result)
     assert rows[1]['Target Terraform'] == 'google_compute_instance.vm'
     assert rows[3]['Target Terraform'] == 'google_cloud_run_v2_service.app'
-    assert 'Inputs / mapping review' in rows[1]['Status']
+    assert 'Mapping review (no inputs required)' in rows[1]['Status']
     assert 'max_instance_count' in rows[3]['Required variables']
 
 
@@ -285,3 +306,51 @@ resource "aws_instance" "vm" {
     assert aws_security_group_name('app-security') == 'app-security'
     r = NormalizedResource('sg-123', 'sg-123', 'AWS', 'security_group')
     assert 'name = "migrated-sg-123"' in generate([r], [], 'AWS')
+
+
+def test_existing_bucket_and_secret_required_inputs_are_in_both_downloaded_files():
+    from multicloud_ai.core.terraform_bundle import split_terraform
+    resources = [resource('Microsoft.Storage/storageAccounts','store'), resource('Microsoft.KeyVault/vaults','vault')]
+    code = '''resource "google_storage_bucket" "store" {
+  name = "existing-name"
+  location = "US"
+}
+resource "google_secret_manager_secret" "vault" {
+  secret_id = "existing-secret"
+  replication {
+    auto {}
+  }
+}
+'''
+    completed = complete_target(code, resources, 'GCP')
+    files = split_terraform(completed)
+    declarations = {name.strip('"') for item in hcl2.loads(files['variables.tf']).get('variable', []) for name in item}
+    assignments = set(hcl2.loads(files['terraform.tfvars']))
+    rows = coverage_rows(resources, '', completed)
+    assert rows[0]['Required variables'] == 'target_store_bucket_name, target_store_storage_class, target_store_storage_location'
+    assert rows[1]['Required variables'] == 'target_vault_secret_id'
+    for row in rows:
+        assert set(row['Required variables'].split(', ')) <= declarations & assignments
+    assert 'Secret container only' in rows[1]['Mapping notes']
+
+
+def test_mapping_only_note_is_not_labelled_as_missing_inputs():
+    r = resource('Microsoft.Storage/storageAccounts','store')
+    code = '''variable "bucket_name" {
+  default = "existing-name"
+}
+variable "storage_location" {
+  default = "US"
+}
+variable "storage_class" {
+  default = "STANDARD"
+}
+resource "google_storage_bucket" "store" {
+  name = var.bucket_name
+  location = var.storage_location
+  storage_class = var.storage_class
+}
+'''
+    row = coverage_rows([r], '', complete_target(code, [r], 'GCP'))[0]
+    assert row['Required variables'] == ''
+    assert 'Mapping review (no inputs required)' in row['Status']

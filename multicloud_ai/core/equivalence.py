@@ -10,6 +10,11 @@ from typing import Any, Dict, Iterable, Optional
 
 
 SERVICE_EQUIVALENTS: Dict[str, Dict[str, str]] = {
+    "message_broker": {"AWS": "Amazon MQ", "Azure": "Self-managed broker on Azure VM", "GCP": "Self-managed broker on Compute Engine"},
+    "graph_database": {"AWS": "Amazon Neptune", "Azure": "Self-managed compatible graph engine on Azure VM", "GCP": "Self-managed compatible graph engine on Compute Engine"},
+    "zfs_storage": {"AWS": "FSx for OpenZFS", "Azure": "Self-managed OpenZFS on Azure VM", "GCP": "Self-managed OpenZFS on Compute Engine"},
+    "virtual_desktop": {"AWS": "Amazon WorkSpaces", "Azure": "Azure Virtual Desktop with session host", "GCP": "Compute Engine session host for existing Citrix environment"},
+    "realtime_database": {"AWS": "DynamoDB + AppSync + Lambda adapter", "Azure": "Cosmos DB + SignalR + customer adapter", "GCP": "Firestore"},
     "compute_instance": {"AWS": "Amazon EC2", "Azure": "Azure Virtual Machines", "GCP": "Compute Engine"},
     "block_storage": {"AWS": "Amazon EBS", "Azure": "Azure Managed Disks", "GCP": "Persistent Disk"},
     "object_storage": {"AWS": "Amazon S3", "Azure": "Azure Blob Storage", "GCP": "Cloud Storage"},
@@ -230,7 +235,8 @@ def source_configuration_fields(resource: Any) -> Dict[str, Any]:
     cfg = _cfg(resource)
     if str(getattr(resource, "cloud", "")).upper() == "AWS" and kind in {
         "route_table", "internet_gateway", "network_acl", "security_group_rule", "ssh_key", "dhcp_options",
-        "identity", "other", "security_group", "network_interface"}:
+        "identity", "other", "security_group", "network_interface", "message_broker", "graph_database",
+        "zfs_storage", "virtual_desktop", "realtime_database"}:
         sections = {k: v for k, v in cfg.items() if isinstance(v, dict) and k not in {
             "resource_explorer", "aws_placement", "billing_meter", "billing_usage"}
             and not k.startswith(("target_", "pricing_"))}

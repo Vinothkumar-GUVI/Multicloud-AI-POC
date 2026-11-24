@@ -48,13 +48,15 @@ def tf_panel(label, cloud, live, edges, billing, configurations, key, evidence_s
         st.caption("AzureRM reads existing resources using your current-cloud credentials and generates native Terraform configuration with import mappings. Generation checks resource coverage and provider validation. SQL passwords are represented by sensitive variables; plan verification is deferred when their values are unavailable. Nothing is deployed or imported into persistent state.")
     else:
         st.caption("AI uses the billing summary, discovered configurations and dependency evidence. Generated code is a reconstruction/migration draft, not imported Terraform state; review before use. Nothing is deployed.")
-    evidence_signature = fingerprint(["native-source-canonical-imports-v12" if native_source else "target-input-coverage-v21" if key == 'confirmed_target_tf' else "source-reconstruction-v10", evidence_signature, cloud])
+    evidence_signature = fingerprint(["native-source-permission-fallback-v15" if native_source else "target-input-coverage-v25" if key == 'confirmed_target_tf' else "source-reconstruction-v10", evidence_signature, cloud])
     saved_key = key + "_result"
     saved = st.session_state.get(saved_key)
     if saved and saved["signature"] != evidence_signature:
         st.session_state.pop(saved_key, None)
         saved = None
-    use_ai = False if native_source else st.checkbox("Use configured AI for this Terraform draft", value=True, key=key + "_ai")
+    use_ai = False if native_source else st.checkbox("Use configured AI for this Terraform draft", value=False, key=key + "_ai")
+    if not native_source:
+        st.caption('Fast generation uses configuration templates and provider validation. Enable AI to request an additional full-draft rewrite, which takes longer.')
     regenerate = st.checkbox("Regenerate Terraform draft", value=False, key=key + "_refresh") if saved else False
     requested = st.button("Generate " + cloud + " Terraform draft", key=key + "_generate")
     if requested and saved and not regenerate and saved.get("use_ai") == use_ai:
@@ -95,7 +97,7 @@ def tf_panel(label, cloud, live, edges, billing, configurations, key, evidence_s
                             resource_display.empty()
                     origin = ('Source configuration with permission-limited templates; manual values and plan verification pending'
                               if '# PERMISSION FALLBACK:' in draft else
-                              'AzureRM-generated source configuration; provider validation passed; SQL plan verification pending'
+                              'AzureRM-generated source configuration; provider validation passed; source plan verification pending'
                               if '# SOURCE PLAN PENDING:' in draft else
                               'AzureRM-generated source configuration; complete import coverage and no-change plan verified')
                 else:
@@ -149,6 +151,9 @@ def tf_panel(label, cloud, live, edges, billing, configurations, key, evidence_s
                 if str(cloud).upper() == 'AWS':
                     from .core.terraform import normalize_aws_security_group_names
                     draft = normalize_aws_security_group_names(draft)
+                if key == 'current_cloud_tf' and cloud == 'AWS':
+                    from .core.aws_permission_notes import annotate_permission_issues
+                    draft = annotate_permission_issues(draft, live)
                 validation = validate_terraform_text(draft, cloud).to_dict()
                 candidate_saved = {"signature": evidence_signature, "text": draft, "validation": validation, "origin": origin, "ai_notice": ai_notice, "use_ai": use_ai}
                 if not native_source:
@@ -172,34 +177,59 @@ def tf_panel(label, cloud, live, edges, billing, configurations, key, evidence_s
         for message in saved["validation"].get("errors", []):
             st.error(message)
         for message in saved["validation"].get("warnings", []):
-            st.warning(message)
-        blocks = len(re.findall(r'^resource "', saved["text"], re.M))
+            if 'resource(s) require manual migration review' not in message:
+                st.warning(message)
+        from .core.source_terraform import resource_addresses
+        blocks = len(resource_addresses(saved['text']))
         reviews = saved["text"].count("# REVIEW REQUIRED:")
+        if key == 'current_cloud_tf':
+            from .core.terraform_supporting_resources import source_resource_coverage
+            represented, discovered = source_resource_coverage(live, saved['text'])
+            st.caption(f'Current-cloud resource coverage: {represented}/{discovered} discovered resources represented. System resources can be retained as references rather than recreated.')
         if native_source:
             if '# SYSTEM RESOURCE:' in saved['text']:
                 st.caption('SQL master is retained as an existing system database ID; it is not recreated as an application database.')
             if '# PERMISSION FALLBACK:' in saved['text']:
-                st.caption(f'Source coverage: {blocks} resource blocks. Resources marked PERMISSION FALLBACK require the listed values and configuration checks. Plan verification is pending.')
+                st.caption('Resources marked PERMISSION FALLBACK require the listed values and configuration checks. Plan verification is pending.')
             elif '# SOURCE PLAN PENDING:' in saved['text']:
-                st.caption(f'Source coverage: {blocks} native Terraform resource blocks. Provider validation passed. SQL plan verification is pending until the sensitive password variables are supplied privately.')
+                st.caption('Provider validation passed. Source plan verification is pending; supply the required configuration variables. Keep password values private.')
             else:
-                st.caption(f'Source coverage: {blocks} native Terraform resource blocks. Provider validation and the source import plan passed without infrastructure changes.')
+                st.caption('Provider validation and the source import plan passed without infrastructure changes.')
         else:
             st.caption(f"Draft coverage: {blocks} Terraform resource blocks; {reviews} review markers. Static validation does not establish deployment readiness.")
-        st.code(saved["text"], language="hcl")
-        st.download_button("Download " + cloud + " Terraform draft", saved["text"], key + ".tf", key=key + "_download")
         if key == 'confirmed_target_tf':
-            from .core.target_terraform import required_inputs
-            inputs = sorted(required_inputs(saved['text']))
-            if inputs:
-                st.caption('Required target inputs: ' + ', '.join(inputs) + '. Replace every null in the input template with your configuration; keep secrets private.')
-                st.download_button('Download required target input template',
-                                   json.dumps(dict.fromkeys(inputs), indent=2),
-                                   'target.required.tfvars.json', key=key + '_inputs_download')
+            from .core.terraform_supporting_resources import supporting_resource_rows, target_resource_counts
+            supporting = supporting_resource_rows(saved['text'])
+            counts = target_resource_counts(saved['text'])
+            if counts['mapped_blocks'] is not None:
+                st.caption(f"Target coverage: {counts['covered_sources']}/{counts['source_entries']} source resources represented. Target Terraform blocks: {counts['mapped_blocks']} primary + {counts['additional_blocks']} supporting = {counts['total_blocks']} total.")
+                if counts['shared_source_entries']:
+                    st.caption(f"{counts['shared_source_entries']} source coverage entries share a primary target block with another source resource (for example, a SQL server and its system database).")
+            st.subheader('Additional target Terraform resources')
+            if supporting:
+                st.caption('This list includes supporting components beyond the primary block for each source mapping, plus shared target infrastructure. A block serving as another source resource\'s primary mapping is counted only once. Resources are created only when you apply the draft; for_each and count may create multiple instances.')
+                st.dataframe(pd.DataFrame(supporting), hide_index=True, use_container_width=True)
+            else:
+                st.caption('No additional supporting blocks were identified from the target coverage mappings.')
+        from .core.terraform_bundle import split_terraform, bundle_zip
+        files = split_terraform(saved['text'])
+        saved['files'] = files
+        st.caption('Extract all three files into one folder. Replace REQUIRED null values in terraform.tfvars before plan/apply; keep passwords and this file private.')
+        for tab, (filename, content) in zip(st.tabs(list(files)), files.items()):
+            with tab:
+                st.code(content, language='hcl')
+                st.download_button('Download ' + filename, content, filename,
+                                   key=key + '_file_' + filename)
+        st.download_button('Download ' + cloud + ' Terraform bundle (ZIP)', bundle_zip(files),
+                           key + '.zip', mime='application/zip', key=key + '_download')
         if st.button("Validate with Terraform CLI", key=key + "_validate"):
             saved["cli"] = validate_cli(saved["text"], cloud)
         if saved.get("cli"):
-            st.json(saved["cli"], expanded=False)
+            validation_status = str(saved["cli"].get("status", "not_run")).replace("_", " ").capitalize()
+            if saved["cli"].get("status") == "passed":
+                st.success("Status: Passed")
+            else:
+                st.warning("Status: " + validation_status)
     return saved
 
 
@@ -210,15 +240,16 @@ def configuration_table_html(configurations):
         fields = r.get("Configuration") or {}
         details = "; ".join(f"{name.replace('_', ' ')}: {json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value}"
                             for name, value in fields.items()) or "Configuration not exposed by discovery"
-        rows.append({"Resource": r.get("Resource", ""), "Service": r.get("Service", ""),
+        rows.append({"Resource": r.get("Resource", ""), "Neutral type": r.get("Neutral type", "other"), "Service": r.get("Service", ""),
                      "Configuration": "Region: " + str(r.get("Region", "")) + "; " + details})
-    table = pd.DataFrame(rows, columns=["Resource", "Service", "Configuration"]).to_html(index=False, escape=True)
+    table = pd.DataFrame(rows, columns=["Resource", "Neutral type", "Service", "Configuration"]).to_html(index=False, escape=True)
     return ('<style>.current-config-table table{width:100%;table-layout:fixed;border-collapse:collapse;}'
             '.current-config-table th,.current-config-table td{text-align:left;vertical-align:top;'
             'white-space:normal;overflow-wrap:anywhere;padding:10px;border:1px solid #8884;}'
-            '.current-config-table th:nth-child(1){width:24%;}'
-            '.current-config-table th:nth-child(2){width:22%;}'
-            '.current-config-table th:nth-child(3){width:54%;}</style>'
+            '.current-config-table th:nth-child(1){width:22%;}'
+            '.current-config-table th:nth-child(2){width:16%;}'
+            '.current-config-table th:nth-child(3){width:20%;}'
+            '.current-config-table th:nth-child(4){width:42%;}</style>'
             '<div class="current-config-table">' + table + '</div>')
 
 
@@ -226,7 +257,25 @@ def render_workflow(source, billing, live, edges, period):
     st.header("Current resource configurations")
     configurations = redact([{"Resource": r.name, "Resource ID": r.resource_id, "Service": r.service or r.raw_type,
                               "Region": r.region, "Raw type": r.raw_type, "Configuration": source_configuration_fields(r)} for r in live])
-    st.html(configuration_table_html(configurations))
+    display_rows = [{**row, "Neutral type": resource.canonical_type or "other"}
+                    for row, resource in zip(configurations, live)]
+    filter_column, sort_column, order_column = st.columns([2, 1, 1])
+    with filter_column:
+        selected_types = st.multiselect("Filter by neutral type",
+            sorted({row["Neutral type"] for row in display_rows}), key="configuration_types_" + source,
+            placeholder="All neutral types")
+    with sort_column:
+        sort_field = st.selectbox("Sort resources by", ["Neutral type", "Resource", "Service"],
+                                  key="configuration_sort_" + source)
+    with order_column:
+        sort_order = st.selectbox("Sort order", ["Ascending", "Descending"], key="configuration_order_" + source)
+    if selected_types:
+        display_rows = [row for row in display_rows if row["Neutral type"] in selected_types]
+    display_rows = sorted(display_rows,
+                          key=lambda row: (str(row[sort_field]).casefold(), str(row["Resource"]).casefold()),
+                          reverse=sort_order == "Descending")
+    st.caption(f"Showing {len(display_rows)} of {len(configurations)} resources")
+    st.html(configuration_table_html(display_rows))
     billing_evidence = [{"Resource ID": r.resource_id, "Cost USD": r.cost, "Usage": r.usage_quantity,
                          "Unit": r.usage_unit, "Service": r.service} for r in billing]
     sig = fingerprint([source, configurations, billing_evidence, [asdict(e) for e in edges]])
@@ -242,7 +291,7 @@ def render_workflow(source, billing, live, edges, period):
         from .core.ai_comparison import estimate_comparison
         monthly = st.checkbox("Project billing period to a 730-hour month", value=bool(period.get("days")), key="ai_monthly_" + source)
         usage_overrides = {}
-        price_sig = fingerprint(["aws-consumed-meter-units-v25" if source == "AWS" else "registry-storage-period-v26", sig, monthly, period])
+        price_sig = fingerprint(["service-equivalence-usage-guards-v30", sig, monthly, period])
         stored = st.session_state.get("ai_pricing_comparison", {})
         refresh = st.checkbox("Request new AI estimates", value=False, key="refresh_ai_pricing")
         if st.button("Generate AI pricing comparison", key="generate_ai_pricing"):
@@ -282,7 +331,6 @@ def render_workflow(source, billing, live, edges, period):
             st.info("Generate the AI pricing comparison to see estimates and a recommendation. Target-cloud credentials are not required.")
             return
         model = stored["model"]
-        st.caption("AI estimates use per-resource configurations and disclosed assumptions, not fixed discount factors. These are planning estimates, not verified provider quotes. Totals and the lowest-cost recommendation are calculated by the application.")
     else:
         factors = {source: 1.0}
         for target in targets:
@@ -290,7 +338,6 @@ def render_workflow(source, billing, live, edges, period):
         monthly = st.checkbox("Project billing period to a 730-hour month", value=bool(period.get("days")), key="model_monthly_" + source)
         model = compare_model(billing, source, factors, period.get("days") if monthly else None)
     scope = "monthly projection" if model["monthly"] else "uploaded billing period"
-    st.caption(f"Period basis: {scope}. Live-only resources without billing are outside this comparison.")
     if model.get("excluded_resources"):
         st.caption(f"Matching comparison scope: {model['comparable_resources']}/{len(model['rows'])} resources. Source cost for the full billing scope: USD {model['observed_source_total']:,.2f}. Blank costs require review.")
     for col, cloud in zip(st.columns(3), [source] + targets):
@@ -315,7 +362,6 @@ def render_workflow(source, billing, live, edges, period):
         for target in targets:
             service = row.get(target + " Service") or "Not specified"
             display[target + " Equivalent Service"] = "Equivalent service pending review" if "planning allowance" in service.lower() else service
-            display[target + " Estimate Basis"] = row.get(target + " Estimate Basis", "AI estimate requires review" if method == "AI resource estimates" else "Manual factor scenario")
         display["Lowest Estimated Cost Cloud"] = row.get("Lowest Estimated Cost Cloud", display.pop("Recommended Cloud", ""))
         display.pop("Recommended Cloud", None)
         display_rows.append(display)
@@ -360,7 +406,7 @@ def render_workflow(source, billing, live, edges, period):
     if target_draft:
         from .core.target_terraform import coverage_rows
         st.subheader('Source and target Terraform resource coverage')
-        st.caption('Matched by source resource ID. Green: generated with no missing inputs detected. Amber: enter variables or check the proposed mapping. Red: no safe target mapping. One source resource can require several target blocks; block counts do not establish equivalence or deployment readiness.')
+        st.caption('Matched by source resource ID. Green: generated with no missing inputs detected. Amber with listed variables: supply those values in terraform.tfvars. Mapping review (no inputs required): read the mapping notes; no additional variable is needed. Red: no safe target mapping. One source resource can require several target blocks; block counts do not establish equivalence or deployment readiness.')
         rows = coverage_rows(target_live, draft['text'], target_draft['text'])
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
         covered = sum(not row['Status'].startswith('🔴') for row in rows)

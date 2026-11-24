@@ -29,6 +29,7 @@ render_workflow('AWS',[r],[r],[],{'days':30})
     app=AppTest.from_string(script).run()
     assert not app.exception
     assert not any('Pricing Comparison' in h.value for h in app.header)
+    app.checkbox(key='current_cloud_tf_ai').check().run()
     app.button(key='current_cloud_tf_generate').click().run()
     assert not app.exception
     assert calls and calls[0]['billing'][0]['Cost USD']==10
@@ -63,6 +64,7 @@ r=NormalizedResource('r','disk','AWS','block_storage',region='us-east-1',sku='gp
 render_workflow('AWS',[r],[r],[],{'days':30})
 """
     app = AppTest.from_string(script).run()
+    app.checkbox(key='current_cloud_tf_ai').check().run()
     app.button(key="current_cloud_tf_generate").click().run()
     assert not app.exception
     assert not app.error
@@ -74,7 +76,8 @@ render_workflow('AWS',[r],[r],[],{'days':30})
         assert 'AI output rejected:' in saved['ai_notice']
         assert 'HCL syntax error' in saved['ai_notice']
         assert 'review it before use' not in saved['ai_notice']
-    assert app.code[0].value.strip() == saved["text"].strip()
+    assert set(saved['files']) == {'main.tf', 'variables.tf', 'terraform.tfvars'}
+    assert 'variable "' not in app.code[0].value
     app.run()
     assert any(saved["ai_notice"] == w.value for w in app.warning)
 

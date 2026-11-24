@@ -12,9 +12,9 @@ from typing import Any, Dict, Iterable
 
 @dataclass(frozen=True)
 class AWSCredentials:
-    access_key_id: str = ""
-    secret_access_key: str = ""
-    session_token: str = ""
+    access_key_id: str = field(default="", repr=False)
+    secret_access_key: str = field(default="", repr=False)
+    session_token: str = field(default="", repr=False)
     region: str = ""
 
     @property
@@ -30,7 +30,7 @@ class AWSCredentials:
 class AzureCredentials:
     tenant_id: str = ""
     client_id: str = ""
-    client_secret: str = ""
+    client_secret: str = field(default="", repr=False)
     subscription_id: str = ""
 
     @property
@@ -46,8 +46,8 @@ class AzureCredentials:
 @dataclass(frozen=True)
 class GCPCredentials:
     project_id: str = ""
-    service_account_info: Dict[str, Any] = field(default_factory=dict)
-    billing_api_key: str = ""
+    service_account_info: Dict[str, Any] = field(default_factory=dict, repr=False)
+    billing_api_key: str = field(default="", repr=False)
 
     @property
     def explicit(self) -> bool:

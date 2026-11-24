@@ -37,24 +37,39 @@ ROLES = {
     ),
     'Builder': 'Review draft Terraform against supplied configuration and diagnostics. Return a complete Terraform file using the terraform field. If no corrections are needed, return the supplied draft unchanged; never leave terraform empty. Preserve resource identities and review comments; never invent missing infrastructure or remove resources to silence errors. No deployment.',
 }
-SENSITIVE = re.compile(r'password|secret|token|credential|private.?key|connection.?string|authorization|api.?key', re.I)
+SENSITIVE = re.compile(r'password|secret|token|credential|private.?key|connection.?string|authorization|api.?key|access.?key|account.?key|sas.?signature', re.I)
 
 from .http_session import system_trust_session as _ai_http_session
 
 
-def redact(value):
+def redact(value, secret_values=()):
+    if not isinstance(secret_values, (tuple, list, set, frozenset)):
+        secret_values = ()
     if isinstance(value, dict):
-        return {str(k): ('[REDACTED]' if SENSITIVE.search(str(k)) else redact(v)) for k, v in value.items()}
+        result = {}
+        for k, v in value.items():
+            if str(k) == 'terraform' and isinstance(v, str):
+                from .terraform_secrets import sanitize_terraform
+                sanitized = sanitize_terraform(v, secret_values)
+                result[str(k)] = sanitized if sanitized is not None else redact(v, secret_values)
+            else:
+                result[str(k)] = '[REDACTED]' if SENSITIVE.search(str(k)) else redact(v, secret_values)
+        return result
     if isinstance(value, (list, tuple)):
-        return [redact(v) for v in value]
+        return [redact(v, secret_values) for v in value]
     if isinstance(value, str):
+        for secret in sorted({str(s) for s in secret_values if s}, key=len, reverse=True):
+            value = value.replace(secret, '[REDACTED]')
         value = re.sub(r'-----BEGIN .*?PRIVATE KEY-----.*?-----END .*?PRIVATE KEY-----', '[REDACTED]', value, flags=re.S)
+        value = re.sub(r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b', '[REDACTED]', value)
+        value = re.sub(r'(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*', 'Bearer [REDACTED]', value)
+        value = re.sub(r'(?i)([?&](?:sig|signature|x-amz-signature|x-goog-signature)=)[^&\s"\']+', r'\1[REDACTED]', value)
         def mask(match):
             candidate = match.group(3)
             if re.fullmatch(r'var\.[A-Za-z_][A-Za-z0-9_]*', candidate):
                 return match.group(0)
             return match.group(1) + match.group(2) + '[REDACTED]'
-        return re.sub(r'(?i)(password|secret|token|api_key|authorization)(\s*[=:]\s*)([^\s,;]+)', mask, value)
+        return re.sub(r'''(?i)((?:[\w-]*(?:password|secret|token|credential|private_key|connection_string|authorization|api_key|access_key|account_key)[\w-]*)["']?)(\s*[=:]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}"'\\]+)''', mask, value)
     return value
 
 
@@ -115,10 +130,12 @@ class AgentClient:
         transport=None,
         get_transport=None,
         max_attempts=2,
+        secret_values=(),
     ):
         if not api_key or not model:
             raise ValueError('Enter an AI API key and a Responses-compatible model/deployment ID to run AI agents.')
         self.api_key = str(api_key).strip()
+        self.secret_values = tuple(s for s in (*secret_values, self.api_key) if s)
         self.model = str(model).strip()
         self.provider = str(provider or 'OpenAI').strip()
         self.base_url = _normalize_base_url(self.provider, base_url)
@@ -155,7 +172,7 @@ class AgentClient:
 
     def _http_error(self, response):
         status = _status_code(response, 0)
-        detail = _safe_error_payload(response)
+        detail = redact(_safe_error_payload(response), self.secret_values)
         host = _safe_host(self.base_url)
         if status == 400:
             guidance = 'Check the model/deployment ID and request compatibility.'
@@ -216,7 +233,9 @@ class AgentClient:
         timeout = getattr(self, 'request_timeout', timeout)
         last_error = None
         proxies = self._proxies()
-        for attempt in range(self.max_attempts):
+        # Model-attempt limits must not disable recovery from transient transport
+        # failures. Invalid certificates and proxy configuration errors fail fast.
+        for attempt in range(max(self.max_attempts, 3)):
             try:
                 response = self.transport(
                     self.endpoint,
@@ -224,8 +243,11 @@ class AgentClient:
                     json=payload,
                     timeout=timeout,
                     proxies=proxies,
+                    allow_redirects=False,
                 )
                 status = _status_code(response, 200)
+                if 300 <= status < 400:
+                    raise RuntimeError('AI endpoint redirect blocked to protect credentials. Configure the final approved HTTPS endpoint directly.')
                 if status >= 400:
                     # Retry only transient server errors. Quota/auth/configuration errors
                     # should be returned immediately and clearly.
@@ -238,16 +260,47 @@ class AgentClient:
                 raise
             except requests.RequestException as exc:
                 last_error = exc
-                if isinstance(exc, requests.exceptions.SSLError) or attempt + 1 >= self.max_attempts:
+                if isinstance(exc, requests.exceptions.SSLError):
+                    reason = str(exc).lower()
+                    certificate_failure = any(token in reason for token in (
+                        'certificate_verify_failed', 'certificate verify failed',
+                        'certificate has expired', 'hostname mismatch', 'self-signed', 'unable to get local issuer'))
+                    interrupted = any(token in reason for token in (
+                        'unexpected_eof', 'eof occurred', 'ssleoferror', 'connection reset',
+                        'remote end closed', 'tlsv1_alert_internal_error'))
+                    if not certificate_failure and interrupted and attempt < 2:
+                        if self.session is not None and getattr(self.transport, '__self__', None) is self.session:
+                            self.session.close()
+                            self.session = _ai_http_session()
+                            self.transport = self.session.post
+                            self.get_transport = self.session.get
+                        time.sleep(attempt + 1)
+                        continue
+                    raise self._network_error(exc) from None
+                connection_interruption = isinstance(exc, requests.exceptions.ConnectionError) and not isinstance(
+                    exc, requests.exceptions.ProxyError)
+                transport_attempts = max(self.max_attempts, 3) if connection_interruption else self.max_attempts
+                if attempt + 1 >= transport_attempts:
                     raise self._network_error(exc) from None
                 time.sleep(1.0 * (attempt + 1))
         raise self._network_error(last_error or requests.ConnectionError()) from None
 
     def request(self, messages, tools, max_output_tokens=6000):
+        # Evidence was structurally sanitized by run_agent. Do not apply field
+        # regexes again to serialized HCL/JSON: they can mask safe secret names.
+        def filter_known(value):
+            if isinstance(value, dict):
+                return {k: filter_known(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [filter_known(v) for v in value]
+            if isinstance(value, str):
+                for secret in sorted(set(self.secret_values), key=len, reverse=True):
+                    value = value.replace(secret, '[REDACTED]')
+            return value
         response = self._post({
             'model': self.model,
             'store': False,
-            'input': messages,
+            'input': filter_known(messages),
             'tools': tools,
             'max_output_tokens': max_output_tokens,
         })
@@ -306,7 +359,7 @@ def _pricing_json(text):
 def run_agent(role, client, evidence, max_turns=5, inline_evidence=False):
     if role not in ROLES:
         raise ValueError('Unknown agent role')
-    evidence = redact(evidence)
+    evidence = redact(evidence, getattr(client, 'secret_values', ()))
     # Do not send raw resource configurations/credentials: the UI supplies a curated evidence set.
     tools = [{'type': 'function', 'name': 'read_evidence',
               'description': 'Read a page of authoritative assessment evidence. Available sections: ' + ', '.join(evidence),
@@ -414,6 +467,6 @@ def run_agent(role, client, evidence, max_turns=5, inline_evidence=False):
             cause = ('no successful evidence read' if not trace and role != 'PricingEstimator' and not inline_evidence
                      else 'invalid JSON or missing required report fields')
             raise RuntimeError('AI report rejected: ' + cause + '; deterministic evidence was not changed.') from None
-        return {'agent': role, 'model': client.model, 'provider': client.provider, 'status': 'AI advisory', 'report': redact(answer),
+        return {'agent': role, 'model': client.model, 'provider': client.provider, 'status': 'AI advisory', 'report': redact(answer, getattr(client, 'secret_values', ())),
                 'trace': trace, 'usage': usage, 'elapsed_seconds': round(time.monotonic()-started, 2)}
     raise RuntimeError('Agent reached its tool-turn limit without a final report. No assessment was changed.')

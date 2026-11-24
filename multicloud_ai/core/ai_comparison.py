@@ -34,6 +34,8 @@ def apply_estimates(baseline, estimates):
         if baseline.get("require_components"):
             contract = contracts.get(rid, {})
             for cloud, detail in entry["targets"].items():
+                from .estimate_guards import validate_service_mapping
+                validate_service_mapping(contract, detail, cloud)
                 parts = detail.get("components")
                 if not isinstance(parts, list) or not parts:
                     raise ValueError(f"AI pricing must provide quantity x unit-rate components for every target; missing components for {cloud} resource {rid}")
@@ -103,8 +105,8 @@ def apply_estimates(baseline, estimates):
                             part["usage_review"] = "Database request-unit to operation conversion is unvalidated; AI quantity retained as an assumption"
                     # A textual quote in the same declared rate unit must agree with the numeric rate.
                     quote_text = part["rate_basis"] + " " + part["description"]
-                    if source == "AWS":
-                        quote_text = re.sub(r"\bper\s+(million|thousand)\b", r"per 1 \1", quote_text, flags=re.I)
+                    quote_text = re.sub(r"\bUSD\s*", "$", quote_text, flags=re.I)
+                    quote_text = re.sub(r"\bper\s+(million|thousand)\b", r"per 1 \1", quote_text, flags=re.I)
                     canonical_quote = re.search(
                         r"\$([0-9]+(?:\.[0-9]+)?)\s*(?:per|/)\s*([0-9,]+)\s*(million\s+|thousand\s+)?(tokens?|requests?|operations?|ops)\b",
                         quote_text, re.I)
@@ -177,6 +179,9 @@ def apply_estimates(baseline, estimates):
                     raise ValueError("AI pricing component total is not finite")
                 detail.setdefault("ai_reported_cost_usd", detail["monthly_cost_usd"])
                 detail["monthly_cost_usd"] = calculated
+                from .estimate_guards import validate_cost_outlier
+                source_row = next(row for row in baseline["rows"] if row["Resource ID"] == rid)
+                validate_cost_outlier(source_row[source + " Cost"], calculated, rid, cloud)
                 if contract.get("logical_sql") and any(x in detail["service"].lower() for x in ["rds", "cloud sql", "postgres"]):
                     raise ValueError(
                         f"SQL logical server/security charges cannot be mapped to a database instance: resource {rid}, target {cloud}. "
@@ -252,6 +257,16 @@ def estimate_comparison(client, billing, source, days, configurations, dependenc
                 meter["source_unit_confirmed"] = not bool(override.get("assumption"))
                 meter["unit_assumption"] = override.get("assumption", "")
         contract["resource_type"] = r.canonical_type
+        from .estimate_guards import workload_contract
+        contract.update(workload_contract(r, configs.get(rid, {})))
+        from .specialized_targets import design_evidence
+        design_resource = deepcopy(r)
+        discovered_fields = configs.get(rid, {}).get('Configuration', {})
+        if isinstance(discovered_fields, dict):
+            design_resource.configuration.update(discovered_fields)
+        designs = [design_evidence(design_resource, target) for target in ('AWS', 'AZURE', 'GCP')]
+        if any(designs):
+            contract['target_deployment_designs'] = [design for design in designs if design]
         contract["enforce_meter_units"] = True
         if r.canonical_type == "compute_instance":
             runtime = []
@@ -285,14 +300,27 @@ def estimate_comparison(client, billing, source, days, configurations, dependenc
         else:
             ai_rows.append(row)
     cache = estimate_cache if estimate_cache is not None else {}
-    from threading import Lock
+    from threading import Lock, Event
     status_lock = Lock()
+    cancelled = Event()
     resource_status = {}
-    def estimate_batch(batch, correction=None, correction_attempt=0, format_attempt=0):
-        saved_rows = [row for row in batch if (row["Resource ID"],) in cache]
+    def estimate_batch_once(batch, correction=None, correction_attempt=0, format_attempt=0):
+        saved_rows, saved = [], []
+        for row in batch:
+            key = (row["Resource ID"],)
+            if key not in cache:
+                continue
+            try:
+                apply_estimates({**baseline, "rows": [row]}, cache[key])
+            except ValueError as exc:
+                # Cached AI proposals are untrusted inputs too. Remove only the
+                # rejected row and feed its failure into a fresh correction.
+                cache.pop(key, None)
+                correction = str(exc)
+            else:
+                saved_rows.append(row)
+                saved.extend(cache[key])
         if saved_rows:
-            saved = [entry for row in saved_rows for entry in cache[(row["Resource ID"],)]]
-            apply_estimates({**baseline, "rows": saved_rows}, saved)
             missing = [row for row in batch if (row["Resource ID"],) not in cache]
             return saved + (estimate_batch(missing, correction, correction_attempt) if missing else [])
         ids = {row["Resource ID"] for row in batch}
@@ -326,6 +354,14 @@ def estimate_comparison(client, billing, source, days, configurations, dependenc
                     "Source export pricing-unit labels are not proof that usage_quantity counts packs. "
                     "Use configuration and documented usage semantics, disclose unresolved source conversions, "
                     "and supply the target region and rate source in each component. Do not claim rate verification."
+                    " Preserve the discovered database API. Cosmos DB must not be mapped to Bigtable. "
+                    "MongoDB requires a MongoDB-compatible service; DynamoDB/Firestore are not drop-in equivalents. "
+                    "Match serverless versus provisioned operation explicitly. A target minimum tier may cost more "
+                    "than the source; disclose its minimum charge, never invent large continuously running nodes. "
+                    "Registry tier-days are not image storage. Never multiply GB-month storage by 730 hours."
+                    " When target_deployment_designs is supplied, price that selected design, including its supporting "
+                    "infrastructure and software/licensing assumptions; do not substitute a different database API "
+                    "or claim application synchronization/migration is automatically included."
                 ),
                 "validation_feedback": {"error": correction or "", "instruction": "Every requested resource and target must include a nonempty components array. Each component needs quantity, unit, unit_price_usd, meter_index, rate_unit, description and rate_basis. Estimate target-specific quantities and rates using discovered configuration and source usage. Disclose uncertain quantities, conversions and rates as assumptions; never copy source cost as a target allowance. Logical SQL servers require security/control-plane equivalents, not an invented database instance. A subtotal alone is insufficient; do not invent evidence."},
                 "dependencies": [e for e in dependencies if str(e.get("source_id", "")).rstrip("/").lower() in ids]}, max_turns=3)
@@ -360,6 +396,10 @@ def estimate_comparison(client, billing, source, days, configurations, dependenc
         try:
             apply_estimates({**baseline, "rows": batch}, batch_estimates)
         except ValueError as exc:
+            if any(reason in str(exc) for reason in ('Target cost outlier', 'Contradictory pricing component')):
+                # Hand off to the iterative pricing recovery loop. Valid rows
+                # were cached above, so only rejected resources are requested again.
+                raise
             if "AI pricing omitted resources" in str(exc) and len(batch) > 1:
                 # Validation reached the coverage check, so returned entries have
                 # valid IDs, target coverage and components. Keep them and recover
@@ -379,6 +419,8 @@ def estimate_comparison(client, billing, source, days, configurations, dependenc
                 return recovered
             recoverable = any(reason in str(exc) for reason in [
                 "unknown or duplicate resource ID",
+                "Incompatible target service", "Incompatible target usage",
+                "Target cost outlier",
                 "missing its quantity unit", "Contradictory pricing component", "Unvalidated usage conversion",
                 "quantity x unit-rate components for every target", "SQL logical server/security charges",
                 "Ambiguous packed target pricing unit",
@@ -396,6 +438,32 @@ def estimate_comparison(client, billing, source, days, configurations, dependenc
         for entry in batch_estimates:
             cache[(str(entry["resource_id"]).strip().rstrip("/").lower(),)] = [entry]
         return batch_estimates
+
+    def estimate_batch(batch, correction=None, correction_attempt=0, format_attempt=0):
+        outlier_attempt = 0
+        while not cancelled.is_set():
+            try:
+                return estimate_batch_once(batch, correction, correction_attempt, format_attempt)
+            except ValueError as exc:
+                if not any(reason in str(exc) for reason in ('Target cost outlier', 'Contradictory pricing component')):
+                    raise
+                outlier_attempt += 1
+                correction = (str(exc) + ' Make the numeric rate agree with its quoted denominator: '
+                              'divide per-million prices by 1000000 and per-thousand prices by 1000 '
+                              'when expressing a rate per single token/request/operation. '
+                              'Recalculate only from source usage and defensible target rates. '
+                              'Do not reduce recorded usage, select an incompatible service, invent discounts '
+                              'or change a correct rate just to satisfy the threshold.')
+                with status_lock:
+                    for row in batch:
+                        if (row['Resource ID'],) not in cache:
+                            resource_status[row['Resource ID']] = (row['Resource'],
+                                f'rechecking quantities and rates (attempt {outlier_attempt})')
+                # No processing deadline or pricing-correction retry limit; avoid a tight
+                # request loop while the model is producing invalid proposals.
+                if cancelled.wait(min(outlier_attempt, 10)):
+                    break
+        raise RuntimeError('Pricing recalculation stopped; completed resource estimates are retained.')
     # Begin the likely expensive requests first and distribute work across batches
     # so a complex database/AI resource is not left until the final request.
     def complexity(row):
@@ -414,14 +482,20 @@ def estimate_comparison(client, billing, source, days, configurations, dependenc
         weights[index] += complexity(row) + 1
     from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
     completed = {}
+    cached_errors = {}
     batch_keys = [tuple(row["Resource ID"] for row in batch) for batch in batches]
     for i, key in enumerate(batch_keys):
         if key in cache:
-            apply_estimates({**baseline, "rows": batches[i]}, cache[key])
-            completed[i] = cache[key]
+            try:
+                apply_estimates({**baseline, "rows": batches[i]}, cache[key])
+            except ValueError as exc:
+                cached_errors[i] = str(exc)
+                cache.pop(key, None)
+            else:
+                completed[i] = cache[key]
     pool = ThreadPoolExecutor(max_workers=3)
     try:
-        pending = {pool.submit(estimate_batch, batch): i for i, batch in enumerate(batches) if i not in completed}
+        pending = {pool.submit(estimate_batch, batch, cached_errors.get(i)): i for i, batch in enumerate(batches) if i not in completed}
         remaining = set(pending)
         while remaining:
             done, remaining = wait(remaining, timeout=1, return_when=FIRST_COMPLETED)
@@ -444,6 +518,7 @@ def estimate_comparison(client, billing, source, days, configurations, dependenc
             if failure is not None:
                 raise failure
     finally:
+        cancelled.set()
         # Do not block the UI while other HTTP calls finish after a failure.
         # Running requests finish independently; queued requests are cancelled.
         pool.shutdown(wait=False, cancel_futures=True)

@@ -22,6 +22,10 @@ def _ai_client(require_consent=True):
         provider=provider,
         base_url=base_url,
         proxy_url=st.session_state.get('ai_proxy_url', ''),
+        secret_values=[st.session_state.get(key, '') for key in (
+            'cred_aws_access_key', 'cred_aws_secret_key', 'cred_aws_session_token',
+            'cred_azure_secret', 'cred_gcp_billing_api_key')]
+            + [(st.session_state.get('cred_gcp_service_account_info') or {}).get('private_key', '')],
     )
 
 

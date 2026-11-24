@@ -6,6 +6,22 @@ from .terraform import _resource_maps, _rid, hcl_string
 from .source_terraform import resource_addresses
 
 
+def _resource_blocks(text):
+    """Exact top-level resource spans, including compact and nested HCL blocks."""
+    import hcl2
+    tree = hcl2.parses(text)
+    tree = tree.to_lark() if hasattr(tree, 'to_lark') else tree
+    result = []
+    for block in tree.children[0].children:
+        if getattr(block, 'data', None) != 'block':
+            continue
+        start, end = block.meta.start_pos, block.meta.end_pos
+        match = re.match(r'resource\s+"([^"]+)"\s+"([^"]+)"\s*\{[\s\S]*', text[start:end])
+        if match:
+            result.append((start, end, match))
+    return result
+
+
 def _references_id(config, rid):
     if isinstance(config, dict):
         return any(_references_id(value, rid) for value in config.values())
@@ -15,8 +31,9 @@ def _references_id(config, rid):
 
 
 def required_inputs(text):
-    return {m[1] for m in re.finditer(r'^variable "([^"]+)" \{.*?^\}', text, re.M | re.S)
-            if not re.search(r'(?m)^\s*default\s*=', m[0])}
+    import hcl2
+    return {name.strip('"') for declaration in hcl2.loads(text).get('variable', [])
+            for name, settings in declaration.items() if 'default' not in settings}
 
 
 def complete_target(text, resources, cloud, dependencies=(), source_text=''):
@@ -53,13 +70,16 @@ def complete_target(text, resources, cloud, dependencies=(), source_text=''):
                 text = re.sub(r'^resource "google_sql_database_instance" "' + re.escape(name) + r'" \{.*?^\}\n?', '', text, flags=re.M | re.S)
     declarations = []
     existing_variables = set(re.findall(r'variable "([^"]+)"', text))
+    if str(cloud).upper() == 'AWS' and re.search(r'\bvar\.aws_region\b', text) and 'aws_region' not in existing_variables:
+        declarations.append('variable "aws_region" {\n  type = string\n  description = "AWS region for the target deployment. Supply the intended region."\n}\n')
+        existing_variables.add('aws_region')
     def value(name, field, type='string', sensitive=False):
         variable = 'target_' + name + '_' + field
         if variable not in existing_variables:
             declarations.append(f'variable "{variable}" {{\n  type = {type}\n  sensitive = {str(sensitive).lower()}\n  description = "Required target configuration: {name} {field}. Supply a validated value."\n}}\n')
             existing_variables.add(variable)
         return 'var.' + variable
-    blocks = list(re.finditer(r'^resource "([^"]+)" "([^"]+)" \{.*?^\}', text, re.M | re.S))
+    blocks = [match for _, _, match in _resource_blocks(text)]
     owners = {}
     for block in blocks:
         candidates = [(rid, name) for rid, name in names.items() if block[2] == name or block[2].startswith(name + '_')]
@@ -110,6 +130,22 @@ def complete_target(text, resources, cloud, dependencies=(), source_text=''):
     for resource in resources:
         rid, name = _rid(resource), names[_rid(resource)]
         raw = resource.raw_type.lower()
+        from .specialized_targets import capability, template as specialized_template
+        if capability(resource):
+            # A generic database/VM block is not evidence of a compatible design.
+            # Replace only this source's owned blocks with the selected design.
+            extra, note = specialized_template(resource, name, cloud, value)
+            if extra:
+                owned = set(owners.get(rid, []))
+                for start, end, block in reversed(_resource_blocks(text)):
+                    if block[1] + '.' + block[2] in owned:
+                        text = text[:start] + text[end:]
+                text += f'\n# TARGET INPUTS REQUIRED: {resource.name}\n# Source ID: {resource.resource_id}\n# Mapping assumption: {note}\n' + '\n'.join(code for _, code in extra)
+                owners[rid] = [address for address, _ in extra]
+                reasons[rid] = note
+                text = re.sub(r'^# REVIEW REQUIRED:[^\n]*\n(?:#[^\n]*(?:\n|$))*',
+                    lambda m: '' if '# Source ID: ' + resource.resource_id + '\n' in m[0] else m[0], text, flags=re.M)
+                continue
         if str(cloud).upper() == 'GCP' and rid not in owners:
             from .gcp_target_templates import template
             extra, note = template(resource, name, value)
@@ -150,11 +186,11 @@ def complete_target(text, resources, cloud, dependencies=(), source_text=''):
                 reason = 'Proposed search data store; migrate documents and schemas, configure a search engine and validate query compatibility.'
             elif raw == 'microsoft.sql/servers':
                 kind = 'google_sql_database_instance'
-                body = f'''  name = {hcl_string(safe_name)}
+                body = f'''  name = {value(name,'instance_name')}
   region = var.gcp_region
   database_version = {value(name,'sqlserver_database_version')}
   root_password = {value(name,'administrator_password',sensitive=True)}
-  deletion_protection = true
+  deletion_protection = {value(name,'deletion_protection','bool')}
   settings {{
     tier = {value(name,'tier')}
     disk_size = {value(name,'disk_size_gb','number')}
@@ -164,7 +200,7 @@ def complete_target(text, resources, cloud, dependencies=(), source_text=''):
       private_network = {value(name,'private_network')}
     }}
   }}'''
-                reason = 'Proposed Cloud SQL SQL Server instance; choose a SQLSERVER version, provision private service access, and validate database features before migrating data.'
+                reason = 'Cloud SQL SQL Server infrastructure with generated APIs and private service access. Supply a supported SQLSERVER version, machine tier, storage and password; database contents are migrated separately.'
             if body:
                 text += f'\n# TARGET INPUTS REQUIRED: {resource.name}\n# Source ID: {resource.resource_id}\n# Mapping assumption: {reason}\nresource "{kind}" "{name}" {{\n{body}\n}}\n'
                 owners[rid] = [kind + '.' + name]
@@ -318,6 +354,8 @@ def complete_target(text, resources, cloud, dependencies=(), source_text=''):
             if kind == 'google_compute_disk' and not re.search(r'\bsnapshot\s*=', block):
                 block = block[:-1] + '  snapshot = ' + value(name,'migrated_snapshot') + '\n}'
             fields = {
+                'google_storage_bucket': [('name','bucket_name','string'), ('location','storage_location','string'), ('storage_class','storage_class','string')],
+                'google_secret_manager_secret': [('secret_id','secret_id','string')],
                 'google_compute_instance': [('image','boot_image','string'), ('machine_type','machine_type','string')],
                 'google_cloud_run_v2_service': [('image','container_image','string')],
                 'google_sql_database_instance': [('database_version','database_version','string'), ('tier','tier','string'), ('disk_size','disk_size_gb','number'), ('availability_type','availability_type','string')],
@@ -341,6 +379,11 @@ def complete_target(text, resources, cloud, dependencies=(), source_text=''):
             for field, suffix, type in fields.get(kind, []):
                 block = re.sub(r'(?m)^(\s*)' + field + r'\s*=.*$',
                     lambda m: m[0] if re.search(r'=\s*var\.', m[0]) else m[1] + field + ' = ' + value(name,suffix,type), block)
+            if kind == 'google_storage_bucket':
+                # storage_class is optional in provider output but must be an
+                # explicit client input in a migration template.
+                if not re.search(r'(?m)^\s*storage_class\s*=', block):
+                    block = block[:-1] + '  storage_class = ' + value(name,'storage_class') + '\n}'
             if kind == 'google_dns_managed_zone' and re.search(r'visibility\s*=\s*"public"', block):
                 owner = next((r for r in resources if 'google_dns_managed_zone.' + name in owners.get(_rid(r), [])), None)
                 if owner and owner.raw_type.lower() == 'microsoft.network/privatednszones':
@@ -362,11 +405,15 @@ def complete_target(text, resources, cloud, dependencies=(), source_text=''):
                                     if kind == 'google_secret_manager_secret' else
                                     'Object-storage destination only; validate any source file shares, queues, tables and access policies separately.')
         return block
-    text = re.sub(r'^resource "([^"]+)" "([^"]+)" \{.*?^\}', parameterize, text, flags=re.M | re.S)
+    for start, end, match in reversed(_resource_blocks(text)):
+        text = text[:start] + parameterize(match) + text[end:]
     text += '\n' + '\n'.join(declarations)
+    if str(cloud).upper() == 'GCP':
+        from .gcp_sql_prerequisites import complete_private_sql
+        text = complete_private_sql(text)
     inputs = required_inputs(text)
     mappings = []
-    resource_blocks = {m[1] + '.' + m[2]: m[0] for m in re.finditer(r'^resource "([^"]+)" "([^"]+)" \{.*?^\}', text, re.M | re.S)}
+    resource_blocks = {m[1] + '.' + m[2]: m[0] for _, _, m in _resource_blocks(text)}
     for resource in resources:
         rid = _rid(resource)
         addresses = owners.get(rid, [])
@@ -384,7 +431,7 @@ def complete_target(text, resources, cloud, dependencies=(), source_text=''):
             visited.add(address)
             code = resource_blocks.get(address, '')
             referenced.update(re.findall(r'\bvar\.(\w+)', code))
-            pending.extend(a for a in resource_blocks if re.search(r'\b' + re.escape(a) + r'\.', code))
+            pending.extend(a for a in resource_blocks if re.search(r'\b' + re.escape(a) + r'(?![\w])', code))
         needed = sorted(inputs & referenced)
         mappings.append({'source_id': resource.resource_id, 'target_addresses': addresses,
             'required_variables': needed, 'mapping_note': reasons.get(rid, '')})
@@ -416,7 +463,7 @@ def coverage_rows(resources, source_text, target_text):
         targets = [a for a in row.get('target_addresses', []) if a in available]
         required = row.get('required_variables', [])
         note = row.get('mapping_note', '')
-        status = 'Missing' if not targets else 'Inputs / mapping review' if required or note else 'Generated'
+        status = 'Missing' if not targets else 'Inputs / mapping review' if required else 'Mapping review (no inputs required)' if note else 'Generated'
         result.append({'Resource': resource.name,
             'Source Terraform': source_imports.get(resource.resource_id.lower(), 'System reference' if resource.name.lower() == 'master' else 'Not found'),
             'Target Terraform': ', '.join(targets) or 'No safe target mapping',

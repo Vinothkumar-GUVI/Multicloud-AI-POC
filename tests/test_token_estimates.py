@@ -4,6 +4,24 @@ from multicloud_ai.core.models import NormalizedResource
 from multicloud_ai.core.ai_comparison import estimate_comparison
 
 
+def test_standard_gpt4o_uses_token_rates_and_never_adds_capacity(monkeypatch):
+    import multicloud_ai.core.ai_comparison as comparison
+    monkeypatch.setattr(comparison, 'run_agent', lambda *args, **kwargs: pytest.fail('Supported GPT-4o usage must not need AI rates'))
+    resources = [NormalizedResource('r', 'centofexcelai', 'Azure', 'generative_ai', cost=.2,
+        usage_quantity=q, usage_unit='10000000', configuration={'billing_meter': {'name':name}})
+        for q,name in [(1000,'gpt 4o 1120 Inp regnl Tokens'), (100,'gpt 4o 1120 Outp regnl Tokens'),
+                       (200,'gpt 4o 1120 cached Inp regnl Tokens')]]
+    result = estimate_comparison(object(),resources,'Azure',None,[],[])
+    assert result['totals']['AWS'] == pytest.approx(1.28)
+    assert result['totals']['GCP'] == pytest.approx(.61)
+
+
+@pytest.mark.parametrize('name', ['gpt 4o batch Inp Tokens','gpt 4o audio Inp Tokens','gpt 4o provisioned Inp Tokens'])
+def test_special_gpt4o_meters_do_not_receive_standard_text_rates(name):
+    assert mini_token_estimate('r',{'resource_type':'generative_ai','meters':[
+        {'name':name,'quantity':1000,'unit':'tokens'}]}) is None
+
+
 def test_mini_model_token_prices_use_published_per_million_denominators():
     contract = {"resource_type": "generative_ai", "meters": [
         {"name": "gpt 4.1 mini Inp glbl Tokens", "quantity": 211001, "unit": "tokens"},

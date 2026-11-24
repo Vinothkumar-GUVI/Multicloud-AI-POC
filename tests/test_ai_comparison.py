@@ -14,6 +14,63 @@ def estimates(aws=80, gcp=90):
     return [{"resource_id":"r","targets":{c:{"monthly_cost_usd":n,"service":"Example","assumptions":"One instance, 730 hours; approximate rate", "components":[{"quantity":1,"unit":"month","rate_unit":"month","unit_price_usd":n,"description":"Monthly component","rate_basis":"Test fixture"}]} for c,n in [("AWS",aws),("GCP",gcp)]}}]
 
 
+@pytest.mark.parametrize('failure_kind', ['threshold', 'contradiction'])
+def test_outlier_recalculates_only_rejected_resource_beyond_previous_retry_limit(monkeypatch, failure_kind):
+    from multicloud_ai.core import ai_comparison as comparison
+    from multicloud_ai.core.models import NormalizedResource
+    from copy import deepcopy
+    calls = []
+    def agent(role, client, evidence, **kwargs):
+        ids = [row['resource_id'] for row in evidence['resources']]
+        calls.append(ids)
+        if len(calls) > 1:
+            assert ids == ['bad']
+            assert 'Do not reduce recorded usage' in evidence['validation_feedback']['error']
+        entries = []
+        for rid in ids:
+            entry = deepcopy(estimates(200 if rid == 'bad' and len(calls) < 5 else 8, 9)[0])
+            entry['resource_id'] = rid
+            if rid == 'bad' and len(calls) < 5 and failure_kind == 'contradiction':
+                entry['targets']['AWS']['components'] = [{'quantity': 1, 'unit': 'requests',
+                    'rate_unit': 'requests', 'unit_price_usd': .3, 'description': 'Request charge',
+                    'rate_basis': '$0.20 per million requests'}]
+            entries.append(entry)
+        return {'report': {'estimates': entries}}
+    monkeypatch.setattr(comparison, 'run_agent', agent)
+    resources = [NormalizedResource(rid, rid, 'Azure', 'other', cost=1) for rid in ['good', 'bad']]
+    cache = {}
+    result = comparison.estimate_comparison(object(),resources,'Azure',None,[],[],estimate_cache=cache)
+    assert len(calls) == 5
+    assert result['totals']['AWS'] == 16
+    assert cache[('good',)][0]['targets']['AWS']['monthly_cost_usd'] == 8
+
+
+@pytest.mark.parametrize('source', ['Azure', 'AWS', 'GCP'])
+@pytest.mark.parametrize('prefix', ['$', 'USD '])
+def test_million_request_quote_is_normalized_for_every_source(source, prefix):
+    targets = [c for c in ['Azure', 'AWS', 'GCP'] if c != source]
+    baseline = {'source': source, 'require_components': True,
+                'rows': [{'Resource ID': 'r', source + ' Cost': 0}]}
+    entry = {'resource_id': 'r', 'targets': {c: {
+        'monthly_cost_usd': 200000, 'service': 'Serverless requests',
+        'assumptions': 'One million requests; rate quoted per million.',
+        'components': [{'quantity': 1000000, 'unit': 'requests', 'rate_unit': 'requests',
+                        'unit_price_usd': .2, 'description': 'Requests',
+                        'rate_basis': prefix + '0.20 per million requests'}]} for c in targets}}
+    result = apply_estimates(baseline, [entry])
+    for cloud in targets:
+        assert result['totals'][cloud] == pytest.approx(.2)
+
+
+@pytest.mark.parametrize('source_cost,target_cost', [(0, 200000), (10, 1000), (100, 1001)])
+def test_unexplained_cost_outliers_cannot_enter_totals(source_cost, target_cost):
+    baseline = base()
+    baseline['require_components'] = True
+    baseline['rows'][0]['Azure Cost'] = source_cost
+    with pytest.raises(ValueError, match='Target cost outlier'):
+        apply_estimates(baseline, estimates(target_cost, target_cost))
+
+
 @pytest.mark.parametrize('problem', ['identical_duplicate', 'conflicting_duplicate', 'extra_unknown'])
 def test_batch_id_errors_recover_without_double_counting_or_losing_cache(monkeypatch, problem):
     from copy import deepcopy

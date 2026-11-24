@@ -7,6 +7,40 @@ from multicloud_ai.core.agents import AgentClient
 
 
 class AIConnectivityTests(unittest.TestCase):
+    def test_connection_interruption_recovers_for_single_attempt_pricing_client(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {'output': []}
+        transport = Mock(side_effect=[requests.ConnectionError('connection reset'), response])
+        client = AgentClient('secret', 'model', transport=transport, max_attempts=1)
+        with patch('multicloud_ai.core.agents.time.sleep'):
+            self.assertEqual(client.request([], []), {'output': []})
+        self.assertEqual(transport.call_count, 2)
+
+    def test_persistent_connection_failure_has_bounded_retries(self):
+        transport = Mock(side_effect=requests.ConnectionError('secret'))
+        client = AgentClient('secret', 'model', transport=transport, max_attempts=1)
+        with patch('multicloud_ai.core.agents.time.sleep'), self.assertRaises(RuntimeError) as ctx:
+            client.request([], [])
+        self.assertEqual(transport.call_count, 3)
+        self.assertNotIn('secret', str(ctx.exception))
+
+    def test_transient_tls_interruption_retries_even_for_single_attempt_pricing_client(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {'output': []}
+        transport = Mock(side_effect=[requests.exceptions.SSLError('[SSL: UNEXPECTED_EOF_WHILE_READING]'), response])
+        client = AgentClient('secret', 'model', transport=transport, max_attempts=1)
+        with patch('multicloud_ai.core.agents.time.sleep'):
+            self.assertEqual(client.request([], []), {'output': []})
+        self.assertEqual(transport.call_count, 2)
+
+    def test_certificate_failure_is_not_retried_or_bypassed(self):
+        transport = Mock(side_effect=requests.exceptions.SSLError('[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate'))
+        client = AgentClient('secret', 'model', transport=transport, max_attempts=3)
+        with self.assertRaises(RuntimeError):
+            client.request([], [])
+        self.assertEqual(transport.call_count, 1)
+        self.assertNotEqual(transport.call_args.kwargs.get('verify'), False)
+
     def test_azure_base_url_is_normalized_and_uses_api_key_header(self):
         response = Mock(status_code=200)
         response.json.return_value = {'output': []}

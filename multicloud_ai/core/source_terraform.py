@@ -111,6 +111,141 @@ def import_configuration(resources):
     return '\n'.join(lines), {address for _, address, _ in records if not address.startswith('system_database.')}
 
 
+def source_plan_differences(changes):
+    """Report changed paths only; never expose values from Terraform state."""
+    def paths(before, after, prefix=''):
+        if before == after:
+            return []
+        if isinstance(before, dict) and isinstance(after, dict):
+            return [path for key in sorted(set(before) | set(after))
+                    for path in paths(before.get(key), after.get(key), prefix + ('.' if prefix else '') + key)]
+        if isinstance(before, list) and isinstance(after, list) and len(before) == len(after):
+            return [path for i, (a, b) in enumerate(zip(before, after)) for path in paths(a, b, f'{prefix}[{i}]')]
+        return [prefix or '(resource)']
+    result = []
+    for item in changes:
+        change = item.get('change', {})
+        if item.get('mode', 'managed') != 'managed' or change.get('actions') == ['no-op']:
+            continue
+        fields = paths(change.get('before'), change.get('after'))
+        result.append(item['address'] + ' [' + ', '.join(change.get('actions', [])) + ']: ' + ', '.join(fields[:30]))
+        if item['address'].startswith('azurerm_virtual_machine.'):
+            # Only these explicitly whitelisted non-sensitive import fields may
+            # include values. Never serialize arbitrary state or configuration.
+            for field in ('delete_data_disks_on_termination', 'delete_os_disk_on_termination', 'additional_capabilities'):
+                a, b = (change.get('before') or {}).get(field), (change.get('after') or {}).get(field)
+                def safe(value):
+                    if value is None or type(value) is bool:
+                        return json.dumps(value)
+                    if field == 'additional_capabilities' and isinstance(value, list):
+                        return json.dumps([{'ultra_ssd_enabled': v.get('ultra_ssd_enabled')}
+                                           for v in value if isinstance(v, dict) and
+                                           (v.get('ultra_ssd_enabled') is None or type(v.get('ultra_ssd_enabled')) is bool)])
+                    return '(unavailable)'
+                if a != b:
+                    result.append(field + ': ' + safe(a) + ' -> ' + safe(b))
+    return '; '.join(result)
+
+
+def reconcile_source_scalars(text, changes):
+    """Restore read-back scalar values only; retain the strict final plan check."""
+    tree = hcl2.parses(text)
+    tree = tree.to_lark() if hasattr(tree, 'to_lark') else tree
+    updates = {item['address']: item.get('change', {}) for item in changes
+               if item.get('mode', 'managed') == 'managed' and item.get('change', {}).get('actions') == ['update']}
+    edits = []
+    for block in tree.children[0].children:
+        if getattr(block, 'data', None) != 'block':
+            continue
+        header = text[block.meta.start_pos:block.meta.end_pos]
+        match = re.match(r'resource\s+"([^"]+)"\s+"([^"]+)"', header)
+        if not match:
+            continue
+        change = updates.get(match[1] + '.' + match[2], {})
+        before, after = change.get('before') or {}, change.get('after') or {}
+        body = next(child for child in block.children if getattr(child, 'data', None) == 'body')
+        for attribute in body.children:
+            if getattr(attribute, 'data', None) != 'attribute':
+                continue
+            name = str(attribute.children[0].children[0])
+            if name not in before or before[name] == after.get(name):
+                continue
+            value = before[name]
+            if not isinstance(value, (str, int, float, bool)):
+                continue
+            if re.search(r'password|secret|token|key|certificate|custom_data|user_data', name, re.I):
+                continue
+            if (change.get('before_sensitive') or {}).get(name) or (change.get('after_sensitive') or {}).get(name):
+                continue
+            if (change.get('after_unknown') or {}).get(name):
+                continue
+            current = text[attribute.meta.start_pos:attribute.meta.end_pos]
+            # Never replace a user variable or dependency expression.
+            if re.search(r'\b(?:var|local|data)\.|\$\{', current):
+                continue
+            literal = json.dumps(value, allow_nan=False).replace('${', '$${').replace('%{', '%%{')
+            edits.append((attribute.meta.start_pos, attribute.meta.end_pos, name + ' = ' + literal))
+    for start, end, replacement in sorted(edits, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return reconcile_legacy_vm_import_options(text, updates)
+
+
+def reconcile_legacy_vm_import_options(text, updates):
+    """Repair legacy VM import-only defaults using the observed plan evidence."""
+    declarations = []
+    def block(match):
+        code = match[0]
+        change = updates.get('azurerm_virtual_machine.' + match[1], {})
+        before, after = change.get('before') or {}, change.get('after') or {}
+        if change.get('actions') != ['update']:
+            return code
+        # An omitted Azure capabilities object is not an enabled Ultra SSD
+        # configuration. Do not invent that block during import reconstruction.
+        capability = after.get('additional_capabilities')
+        if ('additional_capabilities' in before and before['additional_capabilities'] in (None, [])
+                and capability == [{'ultra_ssd_enabled': False}]):
+            code = re.sub(r'(?m)^  additional_capabilities\s*\{\s*ultra_ssd_enabled\s*=\s*false\s*\}\s*\n', '', code)
+        elif (before.get('additional_capabilities') == [{'ultra_ssd_enabled': False}]
+              and capability in (None, []) and not re.search(r'\badditional_capabilities\s*\{', code)):
+            code = code[:-1] + '  additional_capabilities {\n    ultra_ssd_enabled = false\n  }\n}'
+        elif (before.get('additional_capabilities') == [{'ultra_ssd_enabled': None}]
+              and capability in (None, []) and not re.search(r'\badditional_capabilities\s*\{', code)):
+            variable = 'source_vm_ultra_ssd_' + match[1].rsplit('_', 1)[-1]
+            declarations.append(f'''variable "{variable}" {{
+  type = bool
+  nullable = false
+  description = "AzureRM imported Ultra SSD capability as null. Supply the existing VM capability from Azure before plan/apply; it was not inferred."
+}}
+''')
+            code = code[:-1] + ('  # Provider imported this capability as null, which cannot be configured literally.\n'
+                               '  additional_capabilities {\n    ultra_ssd_enabled = var.' + variable + '\n  }\n}')
+        flags = []
+        for field in ('delete_data_disks_on_termination', 'delete_os_disk_on_termination'):
+            # These are Terraform destroy policies, not Azure VM properties.
+            # Imported state can have null while the schema supplies false.
+            # Limit the lifecycle exception to this exact null -> false case.
+            if field in before and before[field] is None and after.get(field) is False:
+                assignment = re.search(r'(?m)^\s*' + field + r'\s*=\s*([^\n]+)', code)
+                if assignment and assignment[1].split('#', 1)[0].strip() not in ('false', 'null'):
+                    continue
+                if assignment:
+                    code = re.sub(r'(?m)^(\s*' + field + r'\s*=\s*)null\b', r'\1false', code)
+                if not assignment:
+                    code = code[:-1] + f'  {field} = false\n}}'
+                flags.append(field)
+        if flags:
+            # Never replace an existing lifecycle policy or add ignore_changes
+            # to Azure-facing fields. Generated native imports normally have no
+            # lifecycle block; complex existing policies remain diagnostic errors.
+            if not re.search(r'\blifecycle\s*\{', code):
+                code = code[:-1] + ('  # Import-only Terraform destroy policies were absent from state.\n'
+                        '  # Keep disk deletion disabled; ignore only their null-to-false import drift.\n'
+                        '  lifecycle {\n    ignore_changes = [' + ', '.join(flags) + ']\n  }\n}')
+        return code
+    result = re.sub(r'^resource "azurerm_virtual_machine" "([^"]+)" \{.*?^\}', block, text, flags=re.M | re.S)
+    return result + ('\n' + '\n'.join(declarations) if declarations else '')
+
+
 def normalize_generated_configuration(text):
     """Remove absent optional values that AzureRM's generated HCL treats as set."""
     def resource_block(match):
@@ -181,10 +316,14 @@ def denied_resource_addresses(output):
         if not isinstance(event, dict):
             continue
         diagnostic = event.get('diagnostic') or {}
-        detail = str(diagnostic.get('detail', ''))
-        if diagnostic.get('address') and re.search(r'AuthorizationFailed|403 Forbidden|status 403', detail, re.I):
+        detail = str(diagnostic.get('summary', '')) + ' ' + str(diagnostic.get('detail', ''))
+        if diagnostic.get('address') and permission_denied(detail):
             denied.add(diagnostic['address'])
     return denied
+
+
+def permission_denied(output):
+    return bool(re.search(r'AuthorizationFailed|AuthorizationPermissionMismatch|\b403\b|\bForbidden\b', output, re.I))
 
 
 def missing_permission_summary(diagnostics):
@@ -221,7 +360,7 @@ def permission_template(address, resource, schema, provider, issue):
     lines = [f'# PERMISSION FALLBACK: {resource.name}', '# Source ID: ' + resource.resource_id,
              '# Permission issue: ' + issue.replace('\n', ' '),
              '# MANUAL VALUES REQUIRED: supply the variables and verify optional settings against the source.',
-             '# This is a resource template, not a verified reconstruction.', f'resource "{kind}" "{name}" {{',
+             f'resource "{kind}" "{name}" {{',
              '  provider = ' + provider, *body(schema.get('block', {})), '}']
     return '\n'.join(declarations + lines) + '\n'
 
@@ -298,7 +437,7 @@ def reconstruct_azure(resources, credential_environment=None, progress=None):
             for secret in supplied.values():
                 if secret:
                     diagnostics = diagnostics.replace(str(secret), '[REDACTED]')
-            if re.search(r'AuthorizationFailed|403 Forbidden|status 403', initial.stderr or initial.stdout, re.I):
+            if permission_denied((initial.stderr or '') + '\n' + (initial.stdout or '')):
                 generated_path.write_text('', encoding='utf-8')
             else:
                 raise RuntimeError('Terraform returned no generated resource configuration: ' + str(redact(diagnostics)))
@@ -314,7 +453,7 @@ def reconstruct_azure(resources, credential_environment=None, progress=None):
             generated_path.rename(root / 'resources.saved')
             try:
                 for address in sorted(missing):
-                    if address in denied_resource_addresses(initial.stdout):
+                    if address in denied_resource_addresses((initial.stdout or '') + '\n' + (initial.stderr or '')):
                         permission_errors[address] = 'Azure denied access (403 AuthorizationFailed); required settings could not be read.'
                         recovery_errors.append(address + ': Azure denied access in the initial read; repeated reads were skipped.')
                         continue
@@ -333,8 +472,9 @@ def reconstruct_azure(resources, credential_environment=None, progress=None):
                         recovery.unlink()
                     if result.returncode:
                         recovery_errors.append(address + ': ' + (result.stderr or result.stdout))
-                        if re.search(r'AuthorizationFailed|403 Forbidden|status 403', result.stderr or result.stdout, re.I):
-                            permission_errors[address] = missing_permission_summary(result.stderr or result.stdout) or 'Azure denied access (403); resource configuration could not be read.'
+                        diagnostics = (result.stderr or '') + '\n' + (result.stdout or '')
+                        if permission_denied(diagnostics):
+                            permission_errors[address] = missing_permission_summary(diagnostics) or 'Azure denied access (403); resource configuration could not be read.'
             finally:
                 (root / 'imports.tf').write_text(config, encoding='utf-8')
                 generated_path.write_text(generated, encoding='utf-8')
@@ -390,5 +530,24 @@ def reconstruct_azure(resources, credential_environment=None, progress=None):
         if {c['address'] for c in changes if c.get('mode', 'managed') == 'managed'} != addresses:
             raise RuntimeError('Source plan did not verify every imported resource.')
         if any(c.get('change', {}).get('actions') != ['no-op'] for c in changes if c.get('mode', 'managed') == 'managed'):
-            raise RuntimeError('Generated source configuration would change existing resources; it was not accepted as an exact reconstruction.')
+            corrected = reconcile_source_scalars(generated, changes)
+            if corrected != generated:
+                generated_path.write_text(corrected, encoding='utf-8')
+                command(['validate', '-no-color'], folder)
+                missing_capabilities = [name for name in re.findall(r'variable "(source_vm_ultra_ssd_\w+)"', corrected)
+                                        if not env.get('TF_VAR_' + name)]
+                if missing_capabilities:
+                    return ('# SOURCE PLAN PENDING: AzureRM returned null for a required VM capability.\n'
+                            '# Resource coverage and provider validation passed; source equivalence is not verified.\n'
+                            '# Supply the required Ultra SSD capability variable from Azure before plan/apply.\n'
+                            + config + '\n' + corrected)
+                command(['plan', '-input=false', '-no-color', '-out=source.tfplan'], folder)
+                checked = json.loads(command(['show', '-json', 'source.tfplan'], folder))
+                remaining = checked.get('resource_changes', [])
+                if {c['address'] for c in remaining if c.get('mode', 'managed') == 'managed'} == addresses and all(
+                        c.get('change', {}).get('actions') == ['no-op'] for c in remaining if c.get('mode', 'managed') == 'managed'):
+                    return config + '\n' + corrected
+                changes = remaining
+            raise RuntimeError('Generated source configuration would change existing resources; it was not accepted as an exact reconstruction. '
+                               + source_plan_differences(changes) + '. No changes were applied. Field values are omitted to protect secrets.')
         return config + '\n' + generated

@@ -1,4 +1,9 @@
 PATTERNS = [
+    ("virtual_desktop", ["workspaces:workspace", "desktopvirtualization/hostpools"]),
+    ("message_broker", ["amazonmq", "amazon mq", "mq:broker", "rabbitmq"]),
+    ("graph_database", ["neptune", "rdf graph", "sparql"]),
+    ("zfs_storage", ["openzfs"]),
+    ("realtime_database", ["firestore.googleapis.com/database", "firestore"]),
     ("kubernetes_cluster", ["eks", "gke", "aks", "managedclusters", "kubernetes"]),
     ("serverless_function", ["lambda", "cloud functions", "cloudfunctions", "functionapp"]),
     ("container_service", ["containerapps", "container app", "cloud run", "apprunner", "ecs", "fargate"]),

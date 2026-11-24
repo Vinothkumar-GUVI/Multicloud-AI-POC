@@ -30,6 +30,9 @@
 
         "rds:DescribeDBInstances",
         "rds:DescribeDBClusters",
+        "mq:DescribeBroker",
+        "workspaces:DescribeWorkspaces",
+        "fsx:DescribeFileSystems",
 
         "secretsmanager:DescribeSecret",
         "elasticache:DescribeReplicationGroups",
